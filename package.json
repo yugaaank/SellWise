@@ -1,0 +1,13 @@
+{
+  "name": "ai-sales-agent",
+  "private": true,
+  "workspaces": ["client", "api"],
+  "scripts": {
+    "dev": "concurrently -n api,client -c cyan,magenta \"npm run dev --workspace=api\" \"npm run dev --workspace=client\"",
+    "dev:api": "npm run dev --workspace=api",
+    "dev:client": "npm run dev --workspace=client"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
