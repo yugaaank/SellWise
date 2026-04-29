@@ -34,7 +34,7 @@ export interface UseVoiceCaptureReturn {
 
 const CHUNK_INTERVAL_MS = 250;
 const SILENCE_DURATION_MS = 800; // Time to wait after speech ends
-const MIN_SPEECH_DURATION_MS = 300; // Min time to consider it speech, not noise
+const MIN_SPEECH_DURATION_MS = 150; // Min time to consider it speech, not noise
 const PCM_MIME = "audio/l16";
 
 /**
@@ -75,8 +75,8 @@ function startSpeechDetection(
   let noiseFloor = 0;
   const noiseHistory: number[] = [];
   const NOISE_HISTORY_SIZE = 100; // 10 seconds of noise history
-  const SPEECH_START_SNR = 6; // Threshold to start speech (6dB)
-  const SPEECH_END_SNR = 3; // Lower threshold to end speech (3dB) - hysteresis
+  const SPEECH_START_SNR = 4; // Threshold to start speech (4dB)
+  const SPEECH_END_SNR = 2; // Lower threshold to end speech (2dB) - hysteresis
 
   function updateNoiseFloor(rms: number, isSpeech: boolean) {
     // Update noise floor continuously
@@ -125,9 +125,9 @@ function startSpeechDetection(
   }
 
   // Calibration period - measure initial noise floor (skip if restarting after agent speech)
-  let calibrationFrames = skipCalibration ? 0 : 10; // Reduced to 1 second, or skip entirely
+  let calibrationFrames = skipCalibration ? 0 : 5; // Reduced to 0.5 seconds
   if (skipCalibration) {
-    noiseFloor = 50; // Use moderate default noise floor when skipping calibration
+    noiseFloor = 20; // Lower default for faster pick-up
   }
 
   const timer = setInterval(() => {
@@ -141,8 +141,8 @@ function startSpeechDetection(
         // Use 10th percentile of collected samples as initial noise floor
         const sorted = [...noiseHistory].sort((a, b) => a - b);
         noiseFloor = sorted[Math.floor(sorted.length * 0.1)] || sorted[0];
-        // Cap noise floor to prevent it being too high
-        noiseFloor = Math.min(noiseFloor, 100);
+        // Ensure a minimum noise floor to prevent division by zero or extreme sensitivity
+        noiseFloor = Math.max(Math.min(noiseFloor, 100), 5);
       }
       onVoiceStateChange(false);
       return;
@@ -216,7 +216,7 @@ class AudioStreamPlayer {
   }
 
   async start(): Promise<void> {
-    this.nextStartTime = this.ctx.currentTime + 0.1;
+    this.nextStartTime = this.ctx.currentTime + 0.4; // Increased to 400ms for jitter buffer
     this.isEnded = false;
     this.endPromise = new Promise((resolve) => {
       this.resolveEnd = resolve;
@@ -270,7 +270,7 @@ class AudioStreamPlayer {
 
     const startTime = Math.max(this.nextStartTime, this.ctx.currentTime);
     const duration = buffer.duration;
-    const fadeTime = 0.005;
+    const fadeTime = 0.008; // Increased fade for smoother stitching
 
     localGain.gain.setValueAtTime(0, startTime);
     localGain.gain.linearRampToValueAtTime(1, startTime + fadeTime);
@@ -285,7 +285,7 @@ class AudioStreamPlayer {
       this.checkEndCondition();
     };
 
-    this.nextStartTime = startTime + duration - fadeTime;
+    this.nextStartTime = startTime + duration - fadeTime; // Overlap by fadeTime
   }
 
   private checkEndCondition() {
@@ -449,6 +449,8 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
 
   const sendTurn = useCallback(() => {
     setIsSpeaking(false);
+    setTranscript(null);
+    setReply(null);
 
     const recorder = recorderRef.current;
     const ws = wsRef.current;
@@ -539,8 +541,18 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
         };
 
         switch (msg.type) {
+          case "processing.start":
+            setTranscript(null);
+            setReply(null);
+            setStatus("processing");
+            break;
+
           case "transcript":
             setTranscript(msg.text ?? null);
+            break;
+
+          case "reply.delta":
+            setReply((prev) => (prev || "") + (msg.text ?? ""));
             break;
 
           case "reply":

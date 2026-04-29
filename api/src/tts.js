@@ -1,11 +1,13 @@
-const { Agent } = require("https");
+const { Agent, setGlobalDispatcher } = require("undici");
 
-// Persistent agent to reuse TLS connections
-const httpsAgent = new Agent({
-  keepAlive: true,
-  maxSockets: 10,
-  timeout: 60000
+// High-performance connection pooling for Sarvam API
+const dispatcher = new Agent({
+  keepAliveTimeout: 60000,
+  keepAliveMaxTimeout: 60000,
+  maxSockets: 100,
+  pipelining: 10
 });
+setGlobalDispatcher(dispatcher);
 
 async function synthesize(text) {
   const apiKey = process.env.SARVAM_API_KEY;
@@ -17,8 +19,6 @@ async function synthesize(text) {
       "Content-Type": "application/json",
       "api-subscription-key": apiKey,
     },
-    // keepalive property for Node 18+ global fetch
-    keepalive: true,
     body: JSON.stringify({
       inputs: [text],
       target_language_code: "hi-IN",
@@ -26,7 +26,7 @@ async function synthesize(text) {
       model: "bulbul:v3",
       pace: 1.0,
       speech_sample_rate: 24000,
-      output_audio_codec: "pcm", // raw PCM is best for streaming
+      output_audio_codec: "linear16",
       enable_preprocessing: false,
     }),
   });
@@ -50,7 +50,6 @@ async function synthesizeStream(text, onChunk, signal) {
       "Content-Type": "application/json",
       "api-subscription-key": apiKey,
     },
-    keepalive: true,
     body: JSON.stringify({
       text,
       target_language_code: "hi-IN",
@@ -58,7 +57,7 @@ async function synthesizeStream(text, onChunk, signal) {
       model: "bulbul:v3",
       pace: 1.0,
       speech_sample_rate: 24000,
-      output_audio_codec: "pcm", // raw PCM is best for streaming
+      output_audio_codec: "linear16",
       enable_preprocessing: false,
     }),
     signal,

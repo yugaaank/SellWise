@@ -2,14 +2,14 @@ require("dotenv").config();
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const http = require("http");
-const { transcribe } = require("./stt");
+const { transcribe, createStreamingTranscriber } = require("./stt");
 const { getReplyStream } = require("./llm");
 const { synthesizeStream } = require("./tts");
 const { getInitialStage, advanceStage } = require("./salesScript");
 
 const PORT = process.env.PORT || 8080;
 
-const REQUIRED_ENV = ["GROQ_API_KEY", "SARVAM_API_KEY"];
+const REQUIRED_ENV = ["GROQ_API_KEY", "SARVAM_API_KEY", "DEEPGRAM_API_KEY"];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length > 0) {
   console.warn(`[warn] Missing env vars: ${missing.join(", ")}`);
@@ -53,11 +53,14 @@ wss.on("connection", (ws, req) => {
     stage: getInitialStage(),
     turnCount: 0,
     abortController: new AbortController(),
+    transcriber: null,
+    isProcessing: false,
   };
 
   function interruptPrevious() {
     session.abortController.abort();
     session.abortController = new AbortController();
+    session.isProcessing = false;
   }
 
   async function greetUser() {
@@ -82,6 +85,15 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "audio.end" }));
       }
       session.history.push({ role: "assistant", content: GREETING });
+
+      // Speculative warmup: keep LLM connection hot for faster next response
+      setTimeout(() => {
+        if (session.turnCount === 0) {
+          getReplyStream("hello", session.history, session.stage).next()
+            .then(() => console.log(`[Greet] ${session.id}: LLM warmup complete`))
+            .catch(() => {}); // Ignore errors, this is just warmup
+        }
+      }, 100);
     } catch (err) {
       if (err.name === "AbortError") {
         console.log(`[Greet] ${session.id}: interrupted`);
@@ -109,6 +121,7 @@ wss.on("connection", (ws, req) => {
   // Optimized TTS streamer that pipelines requests
   async function streamTtsOptimized(sentenceQueue, isDone, signal) {
     const jobQueue = [];
+    const log = (msg) => console.log(`[${new Date().toISOString().split('T')[1].split('Z')[0]}] ${msg}`);
     
     const startJob = (sentence) => {
       const job = {
@@ -118,6 +131,7 @@ wss.on("connection", (ws, req) => {
         promise: null
       };
       
+      log(`[TTS] Requesting synthesis: "${sentence.slice(0, 30)}..."`);
       job.promise = (async () => {
         try {
           const speechText = normalizeForTTS(sentence.trim());
@@ -127,7 +141,7 @@ wss.on("connection", (ws, req) => {
           }, signal);
         } catch (err) {
           if (err.name !== "AbortError") {
-            console.error(`[TTS Job] Error for "${sentence.slice(0, 20)}...": ${err.message}`);
+            log(`[TTS] Error for "${sentence.slice(0, 20)}...": ${err.message}`);
           }
         } finally {
           job.done = true;
@@ -154,11 +168,12 @@ wss.on("connection", (ws, req) => {
           if (ws.readyState === ws.OPEN) {
             const buf = Buffer.from(chunk);
             ws.send(buf);
-            if (Math.random() < 0.1) console.log(`[WS] Sent audio chunk: ${buf.length}B`);
+            if (Math.random() < 0.1) log(`[WS] Sent audio chunk: ${buf.length}B`);
           }
         }
 
         if (currentJob.done && currentJob.chunks.length === 0) {
+          log(`[TTS] Finished playing job: "${currentJob.sentence.slice(0, 20)}..."`);
           jobQueue.shift();
         } else {
           // If we have more jobs in queue, they are already fetching in background
@@ -185,81 +200,102 @@ wss.on("connection", (ws, req) => {
     session.chunks = [];
 
     try {
+      const startTime = Date.now();
+      const log = (msg) => console.log(`[${new Date().toISOString().split('T')[1].split('Z')[0]}] ${msg}`);
+      
       ws.send(JSON.stringify({ type: "processing.start" }));
 
       const transcript = await transcribe(chunksToProcess);
       if (signal.aborted) return;
 
-      console.log(`[STT] ${session.id}: "${transcript}"`);
+      log(`[STT] Transcript received: "${transcript}"`);
       ws.send(JSON.stringify({ type: "transcript", text: transcript }));
+
+      // Signal audio start immediately after transcript (before LLM) for lower latency
+      ws.send(JSON.stringify({ type: "audio.start" }));
 
       session.stage = advanceStage(session.stage, session.turnCount, transcript);
       session.turnCount++;
-      console.log(`[Stage] ${session.id}: ${session.stage} (turn ${session.turnCount})`);
+      log(`[Stage] Moved to ${session.stage}`);
 
       let fullReply = "";
       let sentenceBuffer = "";
       const sentenceQueue = [];
       let llmDone = false;
-
-      // Signal single audio stream start for the entire reply
-      ws.send(JSON.stringify({ type: "audio.start" }));
+      let firstChunkSent = false;
+      let firstTokenTime = null;
 
       // TTS consumer — runs concurrently with LLM producer
       const ttsTask = (async () => {
-        console.log(`[Pipeline] Starting TTS streaming`);
+        log(`[TTS] Started consumer worker`);
         await streamTtsOptimized(sentenceQueue, () => llmDone, signal);
-        console.log(`[Pipeline] TTS streaming complete`);
+        log(`[TTS] Finished consumer worker`);
       })();
 
       // LLM producer — pushes sentences without waiting for TTS
       for await (const token of getReplyStream(transcript, session.history, session.stage)) {
         if (signal.aborted) break;
+        if (!firstTokenTime) {
+          firstTokenTime = Date.now();
+          log(`[LLM] First token generated (delay: ${firstTokenTime - startTime}ms)`);
+        }
+        
         fullReply += token;
         sentenceBuffer += token;
+        
+        // Stream text token to client immediately
+        ws.send(JSON.stringify({ type: "reply.delta", text: token }));
 
         const match = sentenceBuffer.search(SENTENCE_END);
-        const wordCount = sentenceBuffer.trim().split(/\s+/).length;
+        const words = sentenceBuffer.trim().split(/\s+/);
+        const wordCount = words.length;
 
-        // Trigger TTS if we hit punctuation OR if the buffer is getting long (7+ words)
-        if (match !== -1 || wordCount >= 7) {
+        // Dynamic splitting: 2 words for the very first chunk, 10 words for subsequent ones
+        const threshold = firstChunkSent ? 10 : 2;
+
+        if (match !== -1 || wordCount >= threshold) {
           let splitPoint = match !== -1 ? match + 1 : sentenceBuffer.length;
           
-          // If splitting by word count, try to split at a space
-          if (match === -1 && wordCount >= 7) {
+          if (match === -1 && wordCount >= threshold) {
             const lastSpace = sentenceBuffer.lastIndexOf(" ");
             if (lastSpace !== -1) splitPoint = lastSpace + 1;
           }
 
           const sentence = sentenceBuffer.slice(0, splitPoint).trim();
           sentenceBuffer = sentenceBuffer.slice(splitPoint);
-          if (sentence.length >= 2) sentenceQueue.push(sentence);
+          if (sentence.length >= 2) {
+            log(`[LLM] Queueing chunk: "${sentence.slice(0, 30)}..."`);
+            sentenceQueue.push(sentence);
+            firstChunkSent = true;
+          }
         }
       }
 
-      // Flush remaining (last sentence may lack trailing punctuation)
+      // Flush remaining
       if (!signal.aborted && sentenceBuffer.trim().length >= 2) {
+        log(`[LLM] Queueing final chunk: "${sentenceBuffer.trim().slice(0, 30)}..."`);
         sentenceQueue.push(sentenceBuffer.trim());
       }
       llmDone = true;
+      log(`[LLM] Full text generated (total length: ${fullReply.length})`);
 
-      // Wait for TTS consumer to drain all queued sentences
+      // Wait for TTS consumer to drain
       await ttsTask;
 
       if (!signal.aborted && ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({ type: "audio.end" }));
+        log(`[Pipeline] All processing and playback signals sent`);
       }
 
       if (!signal.aborted) {
-        console.log(`[LLM] ${session.id}: "${fullReply}"`);
         ws.send(JSON.stringify({ type: "reply", text: fullReply }));
 
         session.history.push(
           { role: "user", content: transcript },
           { role: "assistant", content: fullReply },
         );
-        if (session.history.length > 10) {
-          session.history = session.history.slice(-10);
+        if (session.history.length > 6) {
+          session.history = session.history.slice(-6);
         }
 
         ws.send(JSON.stringify({ type: "processing.done" }));

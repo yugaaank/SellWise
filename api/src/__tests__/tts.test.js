@@ -141,6 +141,6 @@ describe('synthesizeStream', () => {
     const body = JSON.parse(global.fetch.mock.calls[0][1].body)
     expect(body.speaker).toBe('shubh')
     expect(body.model).toBe('bulbul:v3')
-    expect(body.output_audio_codec).toBe('mp3')
+    expect(body.output_audio_codec).toBe('linear16')
   })
 })
