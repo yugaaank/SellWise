@@ -11,6 +11,7 @@ const STATUS_LABEL: Record<VoiceStatus, string> = {
   connecting: "Connecting...",
   recording: "Speak now",
   processing: "Processing...",
+  speaking: "Agent is speaking...",
   error: "Error",
 };
 

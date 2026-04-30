@@ -12,6 +12,7 @@ export type VoiceStatus =
   | "connecting"
   | "recording"
   | "processing"
+  | "speaking"
   | "error";
 
 export interface VoiceSession {
@@ -33,7 +34,7 @@ export interface UseVoiceCaptureReturn {
 }
 
 const CHUNK_INTERVAL_MS = 250;
-const SILENCE_DURATION_MS = 800; // Time to wait after speech ends
+const SILENCE_DURATION_MS = 600; // Snappier response
 const MIN_SPEECH_DURATION_MS = 150; // Min time to consider it speech, not noise
 const PCM_MIME = "audio/l16";
 
@@ -428,11 +429,7 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
           stream,
           ctx,
           () => {
-            // Speech Started: Interrupt agent
-            if (audioPlayerRef.current) {
-              audioPlayerRef.current.destroy();
-              audioPlayerRef.current = null;
-            }
+            // Speech Started: No-op for barge-in disabled
           },
           () => {
             // Speech Ended: Send turn automatically
@@ -560,18 +557,19 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
             break;
 
           case "audio.start": {
-            detectionCleanupRef.current?.();
-            detectionCleanupRef.current = null;
-
-            // Stop recording and speech recognition while agent is speaking
+            // Stop recording and VAD during agent speech
             const recorder = recorderRef.current;
             if (recorder && recorder.state !== "inactive") {
               recorder.stop();
             }
             stopSpeechRecognition();
+            
+            // CRITICAL: Stop VAD detection so it doesn't trigger phantom turns during playback
+            detectionCleanupRef.current?.();
+            detectionCleanupRef.current = null;
 
             setIsSpeaking(false);
-            setStatus("processing");
+            setStatus("speaking");
 
             // Use existing pre-warmed player if available, otherwise create one
             let player = audioPlayerRef.current;
@@ -601,7 +599,7 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
             const currentStream = streamRef.current;
             const currentWs = wsRef.current;
             if (currentStream && currentWs?.readyState === WebSocket.OPEN) {
-              startRecordingWithVAD(currentStream, currentWs, true); // Skip calibration for instant restart
+              startRecordingWithVAD(currentStream, currentWs, true);
               setStatus("recording");
             }
             break;
