@@ -69,11 +69,13 @@
   border-radius: 50%;
   flex-shrink: 0;
 }
-.status-dot--idle       { background: #6b7280; }
-.status-dot--connecting { background: #f59e0b; animation: blink 1s infinite; }
-.status-dot--recording  { background: #22c55e; animation: blink 1.2s infinite; }
-.status-dot--processing { background: #7c3aed; animation: blink 0.8s infinite; }
-.status-dot--error      { background: #ef4444; }
+.status-dot--idle         { background: #6b7280; }
+.status-dot--connecting   { background: #f59e0b; animation: blink 1s infinite; }
+.status-dot--recording    { background: #22c55e; animation: blink 1.2s infinite; }
+.status-dot--processing   { background: #7c3aed; animation: blink 0.8s infinite; }
+.status-dot--speaking     { background: #3b82f6; animation: blink 1s infinite; }
+.status-dot--interrupting { background: #f97316; animation: blink 0.6s infinite; }
+.status-dot--error        { background: #ef4444; }
 
 @keyframes blink {
   0%, 100% { opacity: 1; }

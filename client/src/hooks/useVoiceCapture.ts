@@ -13,6 +13,7 @@ export type VoiceStatus =
   | "recording"
   | "processing"
   | "speaking"
+  | "interrupting"
   | "error";
 
 export interface VoiceSession {
@@ -49,6 +50,7 @@ function startSpeechDetection(
   onSpeechEnd: () => void,
   onVoiceStateChange: (speaking: boolean) => void,
   skipCalibration = false,
+  isPlaybackMode = false,
 ): () => void {
   const source = ctx.createMediaStreamSource(stream);
 
@@ -76,8 +78,9 @@ function startSpeechDetection(
   let noiseFloor = 0;
   const noiseHistory: number[] = [];
   const NOISE_HISTORY_SIZE = 100; // 10 seconds of noise history
-  const SPEECH_START_SNR = 4; // Threshold to start speech (4dB)
-  const SPEECH_END_SNR = 2; // Lower threshold to end speech (2dB) - hysteresis
+  // Higher thresholds during playback to avoid false detection from speaker feedback
+  const SPEECH_START_SNR = isPlaybackMode ? 10 : 4; // 10dB during playback vs 4dB normal
+  const SPEECH_END_SNR = isPlaybackMode ? 6 : 2; // 6dB during playback vs 2dB normal
 
   function updateNoiseFloor(rms: number, isSpeech: boolean) {
     // Update noise floor continuously
@@ -418,8 +421,65 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
     setLiveTranscript(null);
   }, []);
 
+  const isAgentSpeakingRef = useRef(false);
+  const isInterruptingRef = useRef(false); // Guard to prevent multiple interrupt calls
+
+  const sendInterrupt = useCallback(async () => {
+    // Prevent multiple concurrent interrupts
+    if (isInterruptingRef.current) {
+      console.log("[Barge-in] Already interrupting, ignoring duplicate");
+      return;
+    }
+    isInterruptingRef.current = true;
+    // CRITICAL: Stop the recorder first to prevent sending chunks from new recording
+    // while server is processing the interrupt. This ensures clean WebM boundaries.
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      console.log("[Barge-in] Stopping recorder before sending interrupt");
+      
+      // Wait for onstop event to ensure final chunk is sent
+      await new Promise<void>((resolve) => {
+        const checkInactive = () => {
+          if (recorder.state === "inactive") {
+            resolve();
+          } else {
+            setTimeout(checkInactive, 50);
+          }
+        };
+        recorder.onstop = () => resolve();
+        recorder.stop();
+        // Fallback: check state after short delay
+        setTimeout(checkInactive, 100);
+      });
+      
+      // Small delay to let final chunk arrive at server
+      await new Promise(r => setTimeout(r, 100));
+    }
+    
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      console.log("[Barge-in] Sending interrupt signal");
+      ws.send(JSON.stringify({ type: "interrupt" }));
+    }
+    
+    // Immediately stop local audio playback
+    audioPlayerRef.current?.destroy();
+    audioPlayerRef.current = null;
+    
+    // Clear orphaned chunks
+    orphanedChunksRef.current = [];
+    
+    setStatus("interrupting");
+    setIsSpeaking(false);
+    
+    // Reset guard after a delay to allow future interrupts
+    setTimeout(() => {
+      isInterruptingRef.current = false;
+    }, 500);
+  }, []);
+
   const startRecordingWithVAD = useCallback(
-    (stream: MediaStream, ws: WebSocket, skipVadCalibration = false) => {
+    (stream: MediaStream, ws: WebSocket, skipVadCalibration = false, isPlaybackMode = false) => {
       startRecorder(stream, ws);
       startSpeechRecognition();
 
@@ -429,19 +489,27 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
           stream,
           ctx,
           () => {
-            // Speech Started: No-op for barge-in disabled
+            // Speech Started
+            if (isPlaybackMode && isAgentSpeakingRef.current && !isInterruptingRef.current) {
+              // BARGE-IN DETECTED: User spoke while agent was speaking
+              console.log("[Barge-in] User interrupted agent");
+              sendInterrupt().catch(console.error);
+            }
           },
           () => {
-            // Speech Ended: Send turn automatically
-            stopSpeechRecognition();
-            sendTurnRef.current?.();
+            // Speech Ended: Send turn automatically (only when not in playback mode)
+            if (!isPlaybackMode) {
+              stopSpeechRecognition();
+              sendTurnRef.current?.();
+            }
           },
           (speaking) => setIsSpeaking(speaking),
           skipVadCalibration,
+          isPlaybackMode,
         );
       }
     },
-    [startRecorder, startSpeechRecognition, stopSpeechRecognition],
+    [startRecorder, startSpeechRecognition, stopSpeechRecognition, sendInterrupt],
   );
 
   const sendTurn = useCallback(() => {
@@ -557,19 +625,43 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
             break;
 
           case "audio.start": {
-            // Stop recording and VAD during agent speech
+            // Mark agent as speaking for barge-in detection
+            isAgentSpeakingRef.current = true;
+            
+            // Stop MediaRecorder but keep microphone stream alive for barge-in detection
             const recorder = recorderRef.current;
             if (recorder && recorder.state !== "inactive") {
               recorder.stop();
             }
             stopSpeechRecognition();
-            
-            // CRITICAL: Stop VAD detection so it doesn't trigger phantom turns during playback
-            detectionCleanupRef.current?.();
-            detectionCleanupRef.current = null;
 
             setIsSpeaking(false);
             setStatus("speaking");
+
+            // Restart VAD in playback mode (higher thresholds to detect barge-in)
+            const currentStream = streamRef.current;
+            if (currentStream && audioCtxRef.current) {
+              // Clean up old VAD first
+              detectionCleanupRef.current?.();
+              // Start new VAD in playback mode with higher SNR thresholds
+              detectionCleanupRef.current = startSpeechDetection(
+                currentStream,
+                audioCtxRef.current,
+                () => {
+                  // BARGE-IN: User spoke during agent speech
+                  if (isInterruptingRef.current) return; // Guard
+                  console.log("[Barge-in] Detected user speech during playback");
+                  sendInterrupt().catch(console.error);
+                },
+                () => {
+                  // Speech ended during playback - no action needed
+                  // (we don't auto-send turn during agent speech)
+                },
+                (speaking) => setIsSpeaking(speaking),
+                true, // skipCalibration
+                true, // isPlaybackMode - higher SNR thresholds
+              );
+            }
 
             // Use existing pre-warmed player if available, otherwise create one
             let player = audioPlayerRef.current;
@@ -589,6 +681,9 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
           }
 
           case "audio.end": {
+            // Agent finished speaking
+            isAgentSpeakingRef.current = false;
+            
             const player = audioPlayerRef.current;
             if (player) {
               await player.end();
@@ -599,7 +694,8 @@ export function useVoiceCapture(wsUrl: string): UseVoiceCaptureReturn {
             const currentStream = streamRef.current;
             const currentWs = wsRef.current;
             if (currentStream && currentWs?.readyState === WebSocket.OPEN) {
-              startRecordingWithVAD(currentStream, currentWs, true);
+              // Restart recording in normal mode (not playback mode)
+              startRecordingWithVAD(currentStream, currentWs, true, false);
               setStatus("recording");
             }
             break;

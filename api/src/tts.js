@@ -70,6 +70,12 @@ async function synthesizeStream(text, onChunk, signal) {
 
   const reader = response.body.getReader();
   while (true) {
+    // Check for abort signal during streaming (for barge-in)
+    if (signal?.aborted) {
+      reader.cancel();
+      throw new Error("TTS aborted");
+    }
+    
     const { done, value } = await reader.read();
     if (done) break;
     await onChunk(value);

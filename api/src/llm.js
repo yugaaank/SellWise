@@ -92,9 +92,14 @@ async function getReply(transcript, history = [], stage = 'greeting') {
   return response.choices[0].message.content
 }
 
-async function* getReplyStream(transcript, history = [], stage = 'greeting') {
+async function* getReplyStream(transcript, history = [], stage = 'greeting', signal = null) {
   const apiKey = process.env.GROQ_API_KEY
   if (!apiKey) throw new Error('GROQ_API_KEY not configured')
+
+  // Check for abort before starting
+  if (signal?.aborted) {
+    throw new Error('LLM aborted')
+  }
 
   const groq = new Groq({ apiKey })
 
@@ -113,6 +118,11 @@ async function* getReplyStream(transcript, history = [], stage = 'greeting') {
   })
 
   for await (const chunk of stream) {
+    // Check for abort signal during streaming (for barge-in)
+    if (signal?.aborted) {
+      throw new Error('LLM aborted')
+    }
+    
     const token = chunk.choices[0]?.delta?.content
     if (token) yield token
   }

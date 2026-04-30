@@ -54,6 +54,7 @@ wss.on("connection", (ws, req) => {
     turnCount: 0,
     transcriber: null,
     isProcessing: false,
+    abortController: null, // For cancelling TTS/LLM operations
   };
 
   async function greetUser() {
@@ -92,9 +93,16 @@ wss.on("connection", (ws, req) => {
   }
 
   // Optimized TTS streamer that pipelines requests
-  async function streamTtsOptimized(sentenceQueue, isDone) {
+  async function streamTtsOptimized(sentenceQueue, isDone, signal) {
     const jobQueue = [];
     const log = (msg) => console.log(`[${new Date().toISOString().split('T')[1].split('Z')[0]}] ${msg}`);
+    
+    // Check for abort signal
+    const checkAbort = () => {
+      if (signal?.aborted) {
+        throw new Error('TTS aborted');
+      }
+    };
     
     const startJob = (sentence) => {
       const job = {
@@ -110,8 +118,11 @@ wss.on("connection", (ws, req) => {
           const speechText = normalizeForTTS(sentence.trim());
           await synthesizeStream(speechText, async (chunk) => {
             job.chunks.push(chunk);
-          });
+          }, signal); // Pass abort signal for barge-in
         } catch (err) {
+          if (err.message === 'TTS aborted') {
+            throw err; // Re-throw to handle upstream
+          }
           log(`[TTS] Error for "${sentence.slice(0, 20)}...": ${err.message}`);
         } finally {
           job.done = true;
@@ -122,8 +133,11 @@ wss.on("connection", (ws, req) => {
     };
 
     while (!isDone() || sentenceQueue.length > 0 || jobQueue.length > 0) {
+      checkAbort(); // Check for interrupt signal
+      
       // Start fetching for new sentences in the queue
       while (sentenceQueue.length > 0) {
+        checkAbort();
         startJob(sentenceQueue.shift());
       }
 
@@ -132,6 +146,7 @@ wss.on("connection", (ws, req) => {
         
         // Send buffered chunks
         while (currentJob.chunks.length > 0) {
+          checkAbort();
           const chunk = currentJob.chunks.shift();
           if (ws.readyState === ws.OPEN) {
             ws.send(Buffer.from(chunk));
@@ -150,6 +165,12 @@ wss.on("connection", (ws, req) => {
   }
 
   async function processSession() {
+    // Prevent race conditions: don't process if already processing
+    if (session.isProcessing) {
+      console.log(`[Pipeline] ${session.id}: already processing, skipping`);
+      return;
+    }
+    
     if (session.chunks.length < 3) {
       console.log(`[Pipeline] Ignoring tiny session (${session.chunks.length} chunks)`);
       session.chunks = [];
@@ -158,6 +179,8 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    session.isProcessing = true;
+    
     const chunksToProcess = session.headerChunk 
       ? [session.headerChunk, ...session.chunks]
       : [...session.chunks];
@@ -186,36 +209,61 @@ wss.on("connection", (ws, req) => {
       let llmDone = false;
       let firstChunkSent = false;
 
+      // Create abort controller for this turn (for barge-in cancellation)
+      session.abortController = new AbortController();
+      const signal = session.abortController.signal;
+      
       // TTS consumer
       const ttsTask = (async () => {
-        await streamTtsOptimized(sentenceQueue, () => llmDone);
+        try {
+          await streamTtsOptimized(sentenceQueue, () => llmDone, signal);
+        } catch (err) {
+          if (err.message === 'TTS aborted') {
+            console.log(`[Pipeline] ${session.id}: TTS cancelled due to interrupt`);
+            return;
+          }
+          throw err;
+        }
       })();
 
       // LLM producer
-      for await (const token of getReplyStream(transcript, session.history, session.stage)) {
-        fullReply += token;
-        sentenceBuffer += token;
-        
-        ws.send(JSON.stringify({ type: "reply.delta", text: token }));
-
-        const match = sentenceBuffer.search(SENTENCE_END);
-        const words = sentenceBuffer.trim().split(/\s+/);
-        const wordCount = words.length;
-        const threshold = firstChunkSent ? 10 : 2;
-
-        if (match !== -1 || wordCount >= threshold) {
-          let splitPoint = match !== -1 ? match + 1 : sentenceBuffer.length;
-          if (match === -1 && wordCount >= threshold) {
-            const lastSpace = sentenceBuffer.lastIndexOf(" ");
-            if (lastSpace !== -1) splitPoint = lastSpace + 1;
+      try {
+        for await (const token of getReplyStream(transcript, session.history, session.stage, signal)) {
+          if (signal.aborted) {
+            console.log(`[Pipeline] ${session.id}: LLM stream aborted`);
+            break;
           }
+          
+          fullReply += token;
+          sentenceBuffer += token;
+          
+          ws.send(JSON.stringify({ type: "reply.delta", text: token }));
 
-          const sentence = sentenceBuffer.slice(0, splitPoint).trim();
-          sentenceBuffer = sentenceBuffer.slice(splitPoint);
-          if (sentence.length >= 2) {
-            sentenceQueue.push(sentence);
-            firstChunkSent = true;
+          const match = sentenceBuffer.search(SENTENCE_END);
+          const words = sentenceBuffer.trim().split(/\s+/);
+          const wordCount = words.length;
+          const threshold = firstChunkSent ? 10 : 2;
+
+          if (match !== -1 || wordCount >= threshold) {
+            let splitPoint = match !== -1 ? match + 1 : sentenceBuffer.length;
+            if (match === -1 && wordCount >= threshold) {
+              const lastSpace = sentenceBuffer.lastIndexOf(" ");
+              if (lastSpace !== -1) splitPoint = lastSpace + 1;
+            }
+
+            const sentence = sentenceBuffer.slice(0, splitPoint).trim();
+            sentenceBuffer = sentenceBuffer.slice(splitPoint);
+            if (sentence.length >= 2) {
+              sentenceQueue.push(sentence);
+              firstChunkSent = true;
+            }
           }
+        }
+      } catch (err) {
+        if (err.message === 'LLM aborted') {
+          console.log(`[Pipeline] ${session.id}: LLM cancelled due to interrupt`);
+        } else {
+          throw err;
         }
       }
 
@@ -244,6 +292,8 @@ wss.on("connection", (ws, req) => {
     } catch (err) {
       console.error(`[Pipeline] ${err.message}`);
       ws.send(JSON.stringify({ type: "error", message: err.message }));
+    } finally {
+      session.isProcessing = false;
     }
   }
 
@@ -259,6 +309,32 @@ wss.on("connection", (ws, req) => {
           greetUser();
         } else if (msg.type === "session.end") {
           processSession();
+        } else if (msg.type === "interrupt") {
+          // BARGE-IN: User interrupted agent speech
+          console.log(`[Barge-in] ${session.id}: received interrupt signal`);
+          
+          // Cancel ongoing TTS/LLM operations
+          if (session.abortController) {
+            console.log(`[Barge-in] ${session.id}: aborting current operations`);
+            session.abortController.abort();
+            session.abortController = null;
+          }
+          
+          // Send audio.end to client to stop playback
+          ws.send(JSON.stringify({ type: "audio.end" }));
+          
+          // DISCARD accumulated chunks from incomplete WebM file
+          // When recorder is stopped mid-stream for barge-in, the WebM isn't properly
+          // finalized and causes "invalid media file" errors. We discard these partial
+          // chunks and wait for the user to complete their new thought naturally.
+          if (session.chunks.length > 0) {
+            console.log(`[Barge-in] ${session.id}: discarding ${session.chunks.length} incomplete chunks (WebM not finalized)`);
+            session.chunks = [];
+          }
+          
+          // Reset header chunk to accept fresh recording from client
+          // After barge-in, client starts a NEW MediaRecorder with its own WebM header
+          session.headerChunk = null;
         }
       } catch {
         console.error("[WS] bad control message");
