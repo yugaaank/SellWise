@@ -37,7 +37,14 @@ export interface UseVoiceCaptureReturn {
 const CHUNK_INTERVAL_MS = 250;
 const SILENCE_DURATION_MS = 600; // Snappier response
 const MIN_SPEECH_DURATION_MS = 150; // Min time to consider it speech, not noise
-const PCM_MIME = "audio/l16";
+const VAD_TICK_MS = 100;
+const MIN_ABSOLUTE_RMS = 6;
+const NOISE_HISTORY_SIZE = 80;
+const START_HANGOVER_TICKS = 2;
+const END_HANGOVER_TICKS = 6;
+const CALIBRATION_TICKS = 8;
+const SPEECH_BAND_MIN_HZ = 180;
+const SPEECH_BAND_MAX_HZ = 3400;
 
 /**
  * Adaptive VAD with dynamic noise floor and SNR-based detection.
@@ -55,8 +62,8 @@ function startSpeechDetection(
   const source = ctx.createMediaStreamSource(stream);
 
   const analyser = ctx.createAnalyser();
-  analyser.fftSize = 1024; // Higher resolution for better frequency analysis
-  analyser.smoothingTimeConstant = 0.2; // Faster response
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.05;
 
   source.connect(analyser);
 
@@ -64,120 +71,118 @@ function startSpeechDetection(
   const sampleRate = ctx.sampleRate;
   const binSize = sampleRate / 2 / analyser.frequencyBinCount;
 
-  // Calculate bin indices for voice band (300Hz - 3000Hz)
-  const minBin = Math.floor(300 / binSize);
-  const maxBin = Math.ceil(3000 / binSize);
+  const minBin = Math.max(1, Math.floor(SPEECH_BAND_MIN_HZ / binSize));
+  const maxBin = Math.min(dataArray.length - 1, Math.ceil(SPEECH_BAND_MAX_HZ / binSize));
+  const lowBandMaxBin = Math.max(1, Math.floor(180 / binSize));
 
-  // VAD state
   let silenceMs = 0;
   let speechMs = 0;
   let isCurrentlySpeaking = false;
   let speechSent = false;
+  let startConfidence = 0;
+  let endConfidence = 0;
+  let speechScoreEma = 0;
 
-  // Noise tracking
   let noiseFloor = 0;
   const noiseHistory: number[] = [];
-  const NOISE_HISTORY_SIZE = 100; // 10 seconds of noise history
-  // Higher thresholds during playback to avoid false detection from speaker feedback
-  const SPEECH_START_SNR = isPlaybackMode ? 10 : 4; // 10dB during playback vs 4dB normal
-  const SPEECH_END_SNR = isPlaybackMode ? 6 : 2; // 6dB during playback vs 2dB normal
+  const SPEECH_START_SCORE = isPlaybackMode ? 14 : 8;
+  const SPEECH_END_SCORE = isPlaybackMode ? 9 : 5;
+  const SPEECH_DETECTION_FLOOR = isPlaybackMode ? 10 : 4;
 
-  function updateNoiseFloor(rms: number, isSpeech: boolean) {
-    // Update noise floor continuously
-    if (rms > 0) {
-      noiseHistory.push(rms);
-      if (noiseHistory.length > NOISE_HISTORY_SIZE) {
-        noiseHistory.shift();
-      }
-      // Use 10th percentile for noise floor (more conservative)
-      const sorted = [...noiseHistory].sort((a, b) => a - b);
-      const percentile = isSpeech ? 0.05 : 0.15;
-      noiseFloor = sorted[Math.floor(sorted.length * percentile)] || rms;
-      // Keep noise floor capped
-      noiseFloor = Math.min(noiseFloor, 100);
+  function pushNoiseSample(value: number) {
+    if (!Number.isFinite(value) || value <= 0) return;
+    noiseHistory.push(value);
+    if (noiseHistory.length > NOISE_HISTORY_SIZE) {
+      noiseHistory.shift();
     }
+    const sorted = [...noiseHistory].sort((a, b) => a - b);
+    const idx = Math.max(0, Math.floor(sorted.length * 0.2));
+    const nextFloor = sorted[idx] ?? value;
+    noiseFloor = noiseFloor === 0 ? nextFloor : noiseFloor * 0.92 + nextFloor * 0.08;
+    noiseFloor = Math.min(Math.max(noiseFloor, 3), 120);
   }
 
-  function calculateSNR(rms: number): number {
-    if (noiseFloor <= 0.1) return rms > 5 ? 10 : 0; // Assume speech if rms is high during calibration
-    const snr = 20 * Math.log10(rms / noiseFloor);
-    return snr;
-  }
-
-  function calculateVoiceBandRMS(): number {
+  function calculateVoiceBandMetrics(): { rms: number; lowRatio: number; bandRatio: number } {
     analyser.getByteFrequencyData(dataArray);
-
-    // Debug: log raw data occasionally
-    if (Math.random() < 0.02) {
-      const maxVal = Math.max(...dataArray);
-      const avgVal = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-      console.log(`Raw audio: max=${maxVal}, avg=${avgVal.toFixed(1)}, bins=${dataArray.length}`);
-    }
-
-    // Calculate RMS only in voice band (300Hz - 3000Hz)
-    let sum = 0;
-    let count = 0;
+    let bandEnergy = 0;
+    let totalEnergy = 0;
+    let lowBandEnergy = 0;
+    let peak = 0;
     for (let i = minBin; i <= maxBin && i < dataArray.length; i++) {
-      // Weight center frequencies more (around 1000-2000Hz where speech energy is highest)
-      const freq = i * binSize;
-      const weight = freq >= 800 && freq <= 2000 ? 1.5 : 1.0;
-      sum += (dataArray[i] * weight) ** 2;
-      count += weight;
+      const value = dataArray[i];
+      const energy = value * value;
+      bandEnergy += energy;
+      totalEnergy += energy;
+      peak = Math.max(peak, value);
+    }
+    for (let i = 1; i <= lowBandMaxBin && i < dataArray.length; i++) {
+      const value = dataArray[i];
+      lowBandEnergy += value * value;
+      totalEnergy += value * value;
     }
 
-    return count > 0 ? Math.sqrt(sum / count) : 0;
+    const rms = bandEnergy > 0 ? Math.sqrt(bandEnergy / Math.max(1, maxBin - minBin + 1)) : 0;
+    const lowRatio = totalEnergy > 0 ? lowBandEnergy / totalEnergy : 0;
+    const bandRatio = totalEnergy > 0 ? bandEnergy / totalEnergy : 0;
+    const peakBoost = peak > 0 ? Math.min(8, peak / 16) : 0;
+
+    return { rms: rms + peakBoost, lowRatio, bandRatio };
   }
 
-  // Calibration period - measure initial noise floor (skip if restarting after agent speech)
-  let calibrationFrames = skipCalibration ? 0 : 5; // Reduced to 0.5 seconds
+  let calibrationFrames = skipCalibration ? 0 : CALIBRATION_TICKS;
   if (skipCalibration) {
-    noiseFloor = 20; // Lower default for faster pick-up
+    noiseFloor = isPlaybackMode ? 12 : 8;
   }
 
   const timer = setInterval(() => {
-    const rms = calculateVoiceBandRMS();
+    const { rms, lowRatio, bandRatio } = calculateVoiceBandMetrics();
 
-    // During calibration, just collect noise samples (don't set noiseFloor yet)
+    // During calibration, collect an initial floor from idle mic input.
     if (calibrationFrames > 0) {
       calibrationFrames--;
-      if (rms > 0) noiseHistory.push(rms);
+      if (rms > 0) pushNoiseSample(rms);
       if (calibrationFrames === 0 && noiseHistory.length > 0) {
-        // Use 10th percentile of collected samples as initial noise floor
         const sorted = [...noiseHistory].sort((a, b) => a - b);
-        noiseFloor = sorted[Math.floor(sorted.length * 0.1)] || sorted[0];
-        // Ensure a minimum noise floor to prevent division by zero or extreme sensitivity
-        noiseFloor = Math.max(Math.min(noiseFloor, 100), 5);
+        const idx = Math.max(0, Math.floor(sorted.length * 0.2));
+        noiseFloor = Math.min(Math.max(sorted[idx] ?? sorted[0] ?? 5, 3), 120);
       }
       onVoiceStateChange(false);
       return;
     }
 
-    const snr = calculateSNR(rms);
+    const safeNoiseFloor = Math.max(noiseFloor, 1);
+    const snr = 20 * Math.log10(Math.max(rms, 1) / safeNoiseFloor);
+    const bandDominance = 10 * Math.log10(Math.max(bandRatio, 0.0001) / Math.max(lowRatio, 0.0001));
+    const rawScore = snr + bandDominance;
+    speechScoreEma = speechScoreEma === 0 ? rawScore : speechScoreEma * 0.7 + rawScore * 0.3;
 
-    // Hysteresis: different thresholds for starting vs ending speech
-    const threshold = isCurrentlySpeaking ? SPEECH_END_SNR : SPEECH_START_SNR;
-    const detected = snr >= threshold;
+    const isLoudEnough = rms >= Math.max(MIN_ABSOLUTE_RMS, noiseFloor * 1.35);
+    const candidateSpeech =
+      isLoudEnough &&
+      speechScoreEma >= (isCurrentlySpeaking ? SPEECH_END_SCORE : SPEECH_START_SCORE);
+    const detected =
+      candidateSpeech || (isCurrentlySpeaking && rms >= noiseFloor * 1.15);
 
-    // Debug logging
-    console.log(`VAD: rms=${rms.toFixed(1)}, noise=${noiseFloor.toFixed(1)}, snr=${snr.toFixed(1)}dB, detected=${detected}`);
+    if (!isCurrentlySpeaking && !detected && rms > 0 && rms < noiseFloor * 1.2) {
+      pushNoiseSample(rms);
+    }
 
-    // Update noise floor tracking
-    updateNoiseFloor(rms, detected || isCurrentlySpeaking);
-
-    onVoiceStateChange(detected);
-
-    if (detected) {
+    if (detected && rms >= SPEECH_DETECTION_FLOOR) {
       speechMs += 100;
       silenceMs = 0;
+      startConfidence = Math.min(startConfidence + 1, START_HANGOVER_TICKS);
+      endConfidence = 0;
 
-      if (!isCurrentlySpeaking && speechMs >= 150) {
+      if (!isCurrentlySpeaking && startConfidence >= START_HANGOVER_TICKS && speechMs >= MIN_SPEECH_DURATION_MS) {
         isCurrentlySpeaking = true;
         onSpeechStart();
       }
     } else {
       silenceMs += 100;
+      startConfidence = 0;
+      endConfidence = Math.min(endConfidence + 1, END_HANGOVER_TICKS);
 
-      if (isCurrentlySpeaking && silenceMs >= SILENCE_DURATION_MS) {
+      if (isCurrentlySpeaking && endConfidence >= END_HANGOVER_TICKS && silenceMs >= SILENCE_DURATION_MS) {
         if (speechMs >= MIN_SPEECH_DURATION_MS && !speechSent) {
           speechSent = true;
           onSpeechEnd();
@@ -187,7 +192,9 @@ function startSpeechDetection(
         speechSent = false;
       }
     }
-  }, 100);
+
+    onVoiceStateChange(isCurrentlySpeaking);
+  }, VAD_TICK_MS);
 
   return () => {
     clearInterval(timer);
