@@ -36,11 +36,11 @@ export interface UseVoiceCaptureReturn {
 
 const CHUNK_INTERVAL_MS = 250;
 const SILENCE_DURATION_MS = 600; // Snappier response
-const MIN_SPEECH_DURATION_MS = 150; // Min time to consider it speech, not noise
+const MIN_SPEECH_DURATION_MS = 200; // Balanced speech requirement
 const VAD_TICK_MS = 100;
-const MIN_ABSOLUTE_RMS = 6;
+const MIN_ABSOLUTE_RMS = 10; // Balanced RMS
 const NOISE_HISTORY_SIZE = 80;
-const START_HANGOVER_TICKS = 2;
+const START_HANGOVER_TICKS = 2; // Balanced sustained signal requirement
 const END_HANGOVER_TICKS = 6;
 const CALIBRATION_TICKS = 8;
 const SPEECH_BAND_MIN_HZ = 180;
@@ -85,9 +85,9 @@ function startSpeechDetection(
 
   let noiseFloor = 0;
   const noiseHistory: number[] = [];
-  const SPEECH_START_SCORE = isPlaybackMode ? 14 : 8;
-  const SPEECH_END_SCORE = isPlaybackMode ? 9 : 5;
-  const SPEECH_DETECTION_FLOOR = isPlaybackMode ? 10 : 4;
+  const SPEECH_START_SCORE = isPlaybackMode ? 14 : 12; // Balanced
+  const SPEECH_END_SCORE = isPlaybackMode ? 9 : 7; // Balanced
+  const SPEECH_DETECTION_FLOOR = isPlaybackMode ? 10 : 6; // Balanced
 
   function pushNoiseSample(value: number) {
     if (!Number.isFinite(value) || value <= 0) return;
@@ -156,15 +156,25 @@ function startSpeechDetection(
     const rawScore = snr + bandDominance;
     speechScoreEma = speechScoreEma === 0 ? rawScore : speechScoreEma * 0.7 + rawScore * 0.3;
 
-    const isLoudEnough = rms >= Math.max(MIN_ABSOLUTE_RMS, noiseFloor * 1.35);
+    const isLoudEnough = rms >= Math.max(MIN_ABSOLUTE_RMS, noiseFloor * 1.6); // Slightly stricter loudness
+    const dynamicStartScore = SPEECH_START_SCORE + (noiseFloor > 15 ? 2 : 0); // Bump threshold in noisy rooms
+    
     const candidateSpeech =
       isLoudEnough &&
-      speechScoreEma >= (isCurrentlySpeaking ? SPEECH_END_SCORE : SPEECH_START_SCORE);
+      speechScoreEma >= (isCurrentlySpeaking ? SPEECH_END_SCORE : dynamicStartScore);
     const detected =
-      candidateSpeech || (isCurrentlySpeaking && rms >= noiseFloor * 1.15);
+      candidateSpeech || (isCurrentlySpeaking && rms >= noiseFloor * 1.5 && speechScoreEma >= SPEECH_END_SCORE - 2);
 
-    if (!isCurrentlySpeaking && !detected && rms > 0 && rms < noiseFloor * 1.2) {
-      pushNoiseSample(rms);
+    // ADAPTIVE NOISE FLOOR:
+    // Update floor whenever 'detected' is false, even if isCurrentlySpeaking is still true.
+    // This allows the floor to adapt during the hangover/silence period after speech.
+    if (!detected && rms > 0) {
+      if (rms < noiseFloor * 2) {
+        pushNoiseSample(rms); // Standard update
+      } else {
+        // Aggressive creep for sudden loud persistent noises (fan, AC)
+        pushNoiseSample(noiseFloor * 1.05 + rms * 0.05);
+      }
     }
 
     if (detected && rms >= SPEECH_DETECTION_FLOOR) {

@@ -71,8 +71,21 @@ wss.on("connection", (ws, req) => {
 
       const queue = [...sentences];
       console.log(`[Greet] Starting optimized TTS: ${sentences.length} sentences`);
-      await streamTtsOptimized(queue, () => true);
-      console.log(`[Greet] Optimized TTS complete`);
+      
+      // Create abort controller for greeting (for barge-in cancellation)
+      session.abortController = new AbortController();
+      const signal = session.abortController.signal;
+
+      try {
+        await streamTtsOptimized(queue, () => true, signal);
+        console.log(`[Greet] Optimized TTS complete`);
+      } catch (err) {
+        if (err.message === 'TTS aborted') {
+          console.log(`[Greet] ${session.id}: greeting cancelled due to interrupt`);
+          return;
+        }
+        throw err;
+      }
 
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({ type: "audio.end" }));
@@ -81,7 +94,7 @@ wss.on("connection", (ws, req) => {
 
       // Speculative warmup
       setTimeout(() => {
-        if (session.turnCount === 0) {
+        if (session.turnCount === 0 && !signal.aborted) {
           getReplyStream("hello", session.history, session.stage).next()
             .then(() => console.log(`[Greet] ${session.id}: LLM warmup complete`))
             .catch(() => {});
