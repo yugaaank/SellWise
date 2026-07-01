@@ -20,10 +20,10 @@ if (missing.length > 0) {
 const SENTENCE_END = /[.!?।\n,;]/;
 
 const GREETING =
-  "नमस्कार — मैं Arjun Mehta बोल रहा हूँ, CreditQ से. " +
-  "हम Indian businesses को help करते हैं कि उनका credit risk covered रहे — " +
-  "एक भी defaulter आपकी cashflow को months तक रोक सकता है. " +
-  "बताओ, आज कल कितने buyers को credit पे माल दे रहे हो?";
+  "Hello, this is Alex from SlipWise. " +
+  "We help businesses streamline their workflows and eliminate manual data entry. " +
+  "Did you know the average team wastes almost 2 full days a week on manual tasks? " +
+  "How much time is your team spending on data entry right now?";
 
 function normalizeForTTS(text) {
   return text
