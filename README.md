@@ -1,4 +1,4 @@
-# AI Sales Agent
+# SlipWise (AI Sales Agent)
 
 A customizable, real-time AI-powered voice sales agent designed as a generic B2B/B2C solution. The agent interacts in natural English, adapting to conversational flow with low latency and smart barge-in support.
 
